@@ -457,6 +457,7 @@ def normalize_email(email) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_emails(cell_value) -> list[str]:
+    """Extract all unique emails from a cell (handles comma-separated lists)."""
     if pd.isna(cell_value) or str(cell_value).strip() == "":
         return []
     found = EMAIL_RE.findall(str(cell_value))
@@ -467,20 +468,6 @@ def extract_emails(cell_value) -> list[str]:
             seen.add(e)
             result.append(e)
     return result
-
-
-def has_verified(row: pd.Series, email: str) -> bool:
-    for col in VERIFIED_COLS:
-        if col in row.index and email in extract_emails(row.get(col, "")):
-            return True
-    return False
-
-
-def detect_source(row: pd.Series, email: str, present_cols: list[str]) -> str:
-    for col in present_cols:
-        if email in extract_emails(row.get(col, "")):
-            return col
-    return "unknown"
 
 
 def load_csv(uploaded_file) -> tuple[pd.DataFrame, bool]:
@@ -505,61 +492,101 @@ def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     present_email_cols = [c for c in EMAIL_COLS if c in df.columns]
     total_input_rows   = len(df)
     total_emails_found = 0
-    cross_row_dupes    = 0
-    duplicate_emails   = set()
-    email_registry: dict[str, dict] = {}
 
     progress = st.progress(0, text="Scanning rows…")
 
+    # ── Pass 1: collect per-row unique emails ────────────────────────────────
+    # For each row we build {email: {is_verified, source}} deduped WITHIN the row.
+    # Same email appearing in both BUSINESS_EMAIL and BUSINESS_VERIFIED_EMAILS
+    # in the same row is counted only once — not a cross-row duplicate.
+    row_data: list[tuple] = []
+    global_email_count: dict[str, int] = {}
+
     for idx, (_, row) in enumerate(df.iterrows()):
-        row_emails, seen_this_row = [], set()
+
+        # Build verified-email set for THIS row first
+        verified_set: set[str] = set()
+        for col in VERIFIED_COLS:
+            if col in present_email_cols:
+                for em in extract_emails(row.get(col, "")):
+                    verified_set.add(em)
+
+        # Walk columns in declaration order; first occurrence wins for source
+        email_to_info: dict[str, dict] = {}
         for col in present_email_cols:
             for em in extract_emails(row.get(col, "")):
-                if em not in seen_this_row:
-                    seen_this_row.add(em)
-                    row_emails.append(em)
+                if em not in email_to_info:          # dedupe within this row
+                    email_to_info[em] = {
+                        "is_verified": em in verified_set,
+                        "source":      col,
+                    }
 
-        total_emails_found += len(row_emails)
+        total_emails_found += len(email_to_info)
 
-        for em in row_emails:
-            is_ver = has_verified(row, em)
-            if em not in email_registry:
-                email_registry[em] = {"row": row, "is_verified": is_ver, "count": 1}
-            else:
-                cross_row_dupes += 1
-                email_registry[em]["count"] += 1
-                duplicate_emails.add(em)
-                if is_ver and not email_registry[em]["is_verified"]:
-                    email_registry[em].update({"row": row, "is_verified": is_ver})
+        # Accumulate global cross-row occurrence counts
+        for em in email_to_info:
+            global_email_count[em] = global_email_count.get(em, 0) + 1
+
+        row_data.append((row, email_to_info))
 
         progress.progress(
             min(int((idx + 1) / total_input_rows * 80), 80),
             text=f"Scanning row {idx + 1:,} / {total_input_rows:,}…",
         )
 
+    # ── Pass 2: build global registry — one output row per unique email ──────
     progress.progress(82, text="Building output rows…")
+
+    # email → {row, is_verified, source, count, is_dupe}
+    email_registry: dict[str, dict] = {}
+
+    for original_row, email_to_info in row_data:
+        for em, info in email_to_info.items():
+            is_cross_dupe = global_email_count[em] > 1
+            if em not in email_registry:
+                email_registry[em] = {
+                    "row":         original_row,
+                    "is_verified": info["is_verified"],
+                    "source":      info["source"],
+                    "count":       global_email_count[em],
+                    "is_dupe":     is_cross_dupe,
+                }
+            else:
+                # Upgrade to verified row if current winner isn't verified
+                if info["is_verified"] and not email_registry[em]["is_verified"]:
+                    email_registry[em].update({
+                        "row":         original_row,
+                        "is_verified": True,
+                        "source":      info["source"],
+                    })
+
+    progress.progress(95, text="Assembling final table…")
+
+    if not email_registry:
+        progress.empty()
+        return pd.DataFrame(), {
+            "input_rows":    total_input_rows,
+            "output_rows":   0,
+            "unique_emails": 0,
+            "cross_dupes":   0,
+            "emails_found":  total_emails_found,
+            "dropped_cols":  [],
+            "dup_count":     0,
+        }
+
+    # ── Build output DataFrame ───────────────────────────────────────────────
     expanded_rows = []
     for email, entry in email_registry.items():
         new_row = entry["row"].copy()
         new_row["PRIMARY_EMAIL"]    = email
         new_row["IS_VERIFIED"]      = entry["is_verified"]
-        new_row["EMAIL_SOURCE"]     = detect_source(entry["row"], email, present_email_cols)
-        new_row["DUPLICATE_FLAG"]   = email in duplicate_emails
+        new_row["EMAIL_SOURCE"]     = entry["source"]
+        new_row["DUPLICATE_FLAG"]   = entry["is_dupe"]
         new_row["OCCURRENCE_COUNT"] = entry["count"]
         expanded_rows.append(new_row)
 
-    progress.progress(95, text="Assembling final table…")
-
-    if not expanded_rows:
-        progress.empty()
-        return pd.DataFrame(), {
-            "input_rows": total_input_rows, "output_rows": 0,
-            "unique_emails": 0, "cross_dupes": cross_row_dupes,
-            "emails_found": total_emails_found,
-            "dropped_cols": [], "dup_count": 0,
-        }
-
     result = pd.DataFrame(expanded_rows).reset_index(drop=True)
+
     cols_to_drop = [c for c in EMAIL_COLS if c in result.columns]
     result.drop(columns=cols_to_drop, inplace=True)
 
@@ -570,14 +597,17 @@ def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     progress.progress(100, text="Done!")
     progress.empty()
 
+    cross_dupes = sum(1 for cnt in global_email_count.values() if cnt > 1)
+    dup_count   = sum(cnt - 1 for cnt in global_email_count.values() if cnt > 1)
+
     return result, {
-        "input_rows"   : total_input_rows,
-        "output_rows"  : len(result),
+        "input_rows":    total_input_rows,
+        "output_rows":   len(result),
         "unique_emails": len(email_registry),
-        "cross_dupes"  : cross_row_dupes,
-        "emails_found" : total_emails_found,
-        "dropped_cols" : cols_to_drop,
-        "dup_count"    : len(duplicate_emails),
+        "cross_dupes":   cross_dupes,
+        "emails_found":  total_emails_found,
+        "dropped_cols":  cols_to_drop,
+        "dup_count":     dup_count,
     }
 
 
@@ -712,7 +742,9 @@ with st.sidebar:
         st.markdown("""
 <div style='font-size:0.8rem; color:#4a6b4d; line-height:1.7'>
 <b style='color:#4ade80'>Dedup rule</b><br>
-Same email in 2 rows → keep the verified row. If neither is verified, first row wins.
+Same email in 2 rows → keep the verified row. If neither is verified, first row wins.<br><br>
+<b style='color:#4ade80'>Multi-email cells</b><br>
+Comma-separated emails in a single cell are each expanded to their own output row.
 </div>
 """, unsafe_allow_html=True)
 
@@ -854,7 +886,7 @@ if active == "expander":
             (stats["emails_found"],  "Emails found",    "dim"),
             (stats["unique_emails"], "Unique emails",   "green"),
             (stats["cross_dupes"],   "Cross-row dupes", "yellow"),
-            (stats["dup_count"],     "In 2+ rows",      "red"),
+            (stats["dup_count"],     "Extra occurrences", "red"),
             (stats["output_rows"],   "Output rows",     "green"),
         ]
         cols = st.columns(6)
